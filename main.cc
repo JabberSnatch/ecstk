@@ -31,6 +31,34 @@ static ComponentID Component() {
     return tag;
 }
 
+template <typename Tuple, uint32_t index>
+void TupleAssignment(Tuple& tuple, void** args)
+{}
+
+template <typename Tuple, uint32_t index, typename T, typename ... Pack>
+void TupleAssignment(Tuple& tuple, void** args)
+{
+    std::get<index>(tuple) = *(T*)*args;
+    TupleAssignment<Tuple, index+1, Pack...>(tuple, args+1);
+}
+
+
+template <typename Tuple, typename Func, typename T, T ...ints>
+void ForwardArguments(Func func, void** args, std::integer_sequence<T, ints...>)
+{
+    Tuple tuple{};
+    //int dummy[sizeof...(ints)] = {( tuple.get<ints>() = args
+    //func(*(std::tuple_element<ints, Tuple>::type*)(args)...);
+    func(std::get<ints>(tuple)...);
+         //args[ints]...);
+}
+
+template <typename Tuple, typename Func, typename T, T ...ints>
+void ForwardTuple(Func func, Tuple const& args, std::integer_sequence<T, ints...>)
+{
+    func(std::get<ints>(args)...);
+}
+
 struct World
 {
     EntityTag SpawnEntity() {
@@ -72,7 +100,13 @@ struct World
     template <typename ... Components>
     void RunSystem(auto callback)
     {
-        std::vector<ComponentID> tags = { Component<Components>()... };
+        using IndexSequence = std::index_sequence_for<Components...>;
+
+        std::array<ComponentID, sizeof...(Components)> tags = { Component<Components>()... };
+        std::array<ComponentStorage const*, sizeof...(Components)> storages = {
+            &components[Component<Components>()]...
+        };
+
         for (size_t entity_index = 0; entity_index < entities.size(); ++entity_index)
         {
             auto const& bindings = entities[entity_index];
@@ -84,6 +118,29 @@ struct World
                     != bindings.end();
             }))
             {
+                std::array<void*, sizeof...(Components)> components = {};
+
+                for (size_t tag_index = 0; tag_index < components.size(); ++tag_index)
+                {
+                    ComponentID tag = tags[tag_index];
+                    ComponentBinding const& binding =
+                        *std::find_if(bindings.begin(), bindings.end(),
+                                      [tag](ComponentBinding const& binding){
+                                          return binding.type == tag;
+                                      });
+
+                    ComponentStorage const& storage = *storages[tag_index];
+                    components[tag_index] = storage.data + storage.size*binding.tag;
+                }
+
+                void** argument = &components[0];
+
+                using Tuple = std::tuple<Components...>;
+                Tuple tuple{};
+                TupleAssignment<Tuple, 0, Components...>(tuple, argument);
+                //ForwardArguments<std::tuple<Components...>>(callback, argument, IndexSequence{});
+                ForwardTuple(callback, tuple, IndexSequence{});
+
                 std::cout << "match found " << entity_index << std::endl;
             }
         }
@@ -116,8 +173,8 @@ int main(int argc, char const** argv)
     {
         {
             EntityTag entity = world.SpawnEntity();
-            world.BindComponent(entity, Transform{ 0.f, 1.f, 2.f });
-            world.BindComponent(entity, RenderData{ 4 });
+            world.BindComponent(entity, Transform{ 0.f + (float)index, 100.f, 200.f });
+            world.BindComponent(entity, RenderData{ (int)index+5 });
         }
 
         {
@@ -127,7 +184,8 @@ int main(int argc, char const** argv)
     }
 
     world.RunSystem<Transform, RenderData>(
-        [](Transform const&, RenderData const&){
+        [](Transform const& transform, RenderData const& renderData){
+            std::cout << transform.x << " " << transform.y << " " << transform.z << std::endl;
         }
     );
 
