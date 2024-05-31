@@ -2,6 +2,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cstring>
+#include <type_traits>
 #include <iostream>
 
 using EntityTag = uint64_t;
@@ -26,10 +27,19 @@ static ComponentID DeclareComponent() {
 };
 
 template <typename T>
-static ComponentID Component() {
+static ComponentID ComponentImpl() {
     static ComponentID const tag = DeclareComponent();
     return tag;
 }
+
+template <typename T>
+static ComponentID Component() {
+    return ComponentImpl<typename std::remove_cvref<T>::type>();
+}
+
+template <typename T>
+using TupleType =
+    typename std::add_pointer<typename std::remove_reference<T>::type>::type;
 
 template <typename Tuple, uint32_t index>
 void TupleAssignment(Tuple& tuple, void** args)
@@ -38,25 +48,24 @@ void TupleAssignment(Tuple& tuple, void** args)
 template <typename Tuple, uint32_t index, typename T, typename ... Pack>
 void TupleAssignment(Tuple& tuple, void** args)
 {
-    std::get<index>(tuple) = *(T*)*args;
+    std::get<index>(tuple) = (T*)*args;
     TupleAssignment<Tuple, index+1, Pack...>(tuple, args+1);
-}
-
-
-template <typename Tuple, typename Func, typename T, T ...ints>
-void ForwardArguments(Func func, void** args, std::integer_sequence<T, ints...>)
-{
-    Tuple tuple{};
-    //int dummy[sizeof...(ints)] = {( tuple.get<ints>() = args
-    //func(*(std::tuple_element<ints, Tuple>::type*)(args)...);
-    func(std::get<ints>(tuple)...);
-         //args[ints]...);
 }
 
 template <typename Tuple, typename Func, typename T, T ...ints>
 void ForwardTuple(Func func, Tuple const& args, std::integer_sequence<T, ints...>)
 {
-    func(std::get<ints>(args)...);
+    func(*std::get<ints>(args)...);
+}
+
+template <typename ... Components>
+void ForwardFunc(auto callback, void** arguments)
+{
+    using IndexSequence = std::index_sequence_for<Components...>;
+    using Tuple = std::tuple<TupleType<Components>...>;
+    Tuple tuple{};
+    TupleAssignment<Tuple, 0, std::remove_reference_t<Components>...>(tuple, arguments);
+    ForwardTuple(callback, tuple, IndexSequence{});
 }
 
 struct World
@@ -100,9 +109,9 @@ struct World
     template <typename ... Components>
     void RunSystem(auto callback)
     {
-        using IndexSequence = std::index_sequence_for<Components...>;
+        static const std::array<ComponentID, sizeof...(Components)> tags =
+            { Component<Components>()... };
 
-        std::array<ComponentID, sizeof...(Components)> tags = { Component<Components>()... };
         std::array<ComponentStorage const*, sizeof...(Components)> storages = {
             &components[Component<Components>()]...
         };
@@ -133,15 +142,7 @@ struct World
                     components[tag_index] = storage.data + storage.size*binding.tag;
                 }
 
-                void** argument = &components[0];
-
-                using Tuple = std::tuple<Components...>;
-                Tuple tuple{};
-                TupleAssignment<Tuple, 0, Components...>(tuple, argument);
-                //ForwardArguments<std::tuple<Components...>>(callback, argument, IndexSequence{});
-                ForwardTuple(callback, tuple, IndexSequence{});
-
-                std::cout << "match found " << entity_index << std::endl;
+                ForwardFunc<Components...>(callback, components.data());
             }
         }
     }
@@ -185,9 +186,32 @@ int main(int argc, char const** argv)
 
     world.RunSystem<Transform, RenderData>(
         [](Transform const& transform, RenderData const& renderData){
-            std::cout << transform.x << " " << transform.y << " " << transform.z << std::endl;
+            std::cout << "(" << transform.x << " " << transform.y << " " << transform.z << ") ";
         }
     );
+    std::cout << std::endl << std::endl;
+
+    world.RunSystem<RenderData, Transform>(
+        [](RenderData& renderData, Transform& transform){
+            std::cout << "(" << transform.x << " " << renderData.mesh_index << ") ";
+            transform.x *= 2.f;
+        }
+    );
+    std::cout << std::endl << std::endl;
+
+    world.RunSystem<Transform const>(
+        [](Transform const& transform) {
+            std::cout << transform.x << " ";
+        }
+    );
+    std::cout << std::endl << std::endl;
+
+    world.RunSystem<RenderData const>(
+        [](RenderData const& renderData) {
+            std::cout << renderData.mesh_index << " ";
+        }
+    );
+    std::cout << std::endl << std::endl;
 
     return 0;
 }
