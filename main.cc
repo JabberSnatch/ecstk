@@ -3,76 +3,17 @@
 #include <unordered_map>
 #include <cstring>
 #include <type_traits>
+#include <memory>
 #include <iostream>
-
-using EntityTag = uint64_t;
-using ComponentID = uint64_t;
-using ComponentTag = uint64_t;
-
-struct ComponentBinding {
-    ComponentID type;
-    ComponentTag tag;
-};
-
-struct ComponentStorage {
-    size_t size;
-    size_t count;
-    size_t alloc_count;
-    uint8_t* data;
-};
-
-static ComponentID DeclareComponent() {
-    static ComponentID next_component = 0;
-    return next_component++;
-};
-
-template <typename T>
-static ComponentID ComponentImpl() {
-    static ComponentID const tag = DeclareComponent();
-    return tag;
-}
-
-template <typename T>
-static ComponentID Component() {
-    return ComponentImpl<typename std::remove_cvref<T>::type>();
-}
-
-template <typename T>
-using TupleType =
-    typename std::add_pointer<typename std::remove_reference<T>::type>::type;
-
-template <typename Tuple, uint32_t index>
-void TupleAssignment(Tuple& tuple, void** args)
-{}
-
-template <typename Tuple, uint32_t index, typename T, typename ... Pack>
-void TupleAssignment(Tuple& tuple, void** args)
-{
-    std::get<index>(tuple) = (T*)*args;
-    TupleAssignment<Tuple, index+1, Pack...>(tuple, args+1);
-}
-
-template <typename Tuple, typename Func, typename T, T ...ints>
-void ForwardTuple(Func func, Tuple const& args, std::integer_sequence<T, ints...>)
-{
-    func(*std::get<ints>(args)...);
-}
-
-template <typename ... CTypes>
-void ForwardFunc(auto callback, void** arguments)
-{
-    using IndexSequence = std::index_sequence_for<CTypes...>;
-    using Tuple = std::tuple<TupleType<CTypes>...>;
-    Tuple tuple{};
-    TupleAssignment<Tuple, 0, std::remove_reference_t<CTypes>...>(tuple, arguments);
-    ForwardTuple(callback, tuple, IndexSequence{});
-}
 
 struct IndexAllocator
 {
     using IndexRange = std::pair<uint64_t, uint64_t>;
 
     IndexAllocator() : free_ranges{ { 0ull, ~0ull } } {}
+
+    uint64_t IndexCount() const { return free_ranges[0].first; }
+
     uint64_t ReserveIndex() {
         if (free_ranges.empty()) return ~0ull;
         IndexRange& first_range = free_ranges.back();
@@ -127,65 +68,155 @@ struct IndexAllocator
     std::vector<IndexRange> free_ranges;
 };
 
+struct BlockAllocator
+{
+    void* operator[](uint64_t index) const {
+        return data[index/block_size].get() + index*element_size;
+    }
+
+    void NewBlock() {
+        data.emplace_back(new uint8_t[element_size * block_size]);
+    }
+
+    size_t StorageSize() const {
+        return data.size() * block_size;
+    }
+
+    size_t element_size;
+    size_t block_size;
+    std::vector<std::unique_ptr<uint8_t[]>> data;
+};
+
+using EntityTag = uint64_t;
+using ComponentID = uint64_t;
+using ComponentTag = uint64_t;
+
+static ComponentID DeclareComponent() {
+    static ComponentID next_component = 0;
+    return next_component++;
+};
+
+template <typename T>
+static ComponentID ComponentImpl() {
+    static ComponentID const tag = DeclareComponent();
+    return tag;
+}
+
+template <typename T>
+static ComponentID Component() {
+    return ComponentImpl<typename std::remove_cvref<T>::type>();
+}
+
+template <typename T>
+using TupleType =
+    typename std::add_pointer<typename std::remove_reference<T>::type>::type;
+
+template <typename Tuple, uint32_t index>
+void TupleAssignment(Tuple& tuple, void** args)
+{}
+
+template <typename Tuple, uint32_t index, typename T, typename ... Pack>
+void TupleAssignment(Tuple& tuple, void** args)
+{
+    std::get<index>(tuple) = (T*)*args;
+    TupleAssignment<Tuple, index+1, Pack...>(tuple, args+1);
+}
+
+template <typename Tuple, typename Func, typename T, T ...ints>
+void ForwardTuple(Func func, Tuple const& args, std::integer_sequence<T, ints...>)
+{
+    func(*std::get<ints>(args)...);
+}
+
+template <typename ... CTypes>
+void ForwardFunc(auto callback, void** arguments)
+{
+    using IndexSequence = std::index_sequence_for<CTypes...>;
+    using Tuple = std::tuple<TupleType<CTypes>...>;
+    Tuple tuple{};
+    TupleAssignment<Tuple, 0, std::remove_reference_t<CTypes>...>(tuple, arguments);
+    ForwardTuple(callback, tuple, IndexSequence{});
+}
+
 struct World
 {
     EntityTag SpawnEntity();
+    void KillEntity(EntityTag e);
     template <typename CType> void BindComponent(EntityTag e, CType const& c);
     template <typename ... CTypes> void RunSystem(auto callback);
 
     void Commit();
 
-    struct state_t
-    {
-        EntityTag next_entity;
-        std::vector<std::vector<ComponentBinding>> entities;
-        std::unordered_map<ComponentID, ComponentStorage> components;
+    struct ComponentBinding {
+        ComponentID type;
+        ComponentTag tag;
     };
 
-    state_t current_state;
-    state_t pending_state;
+    struct ComponentStorage {
+        IndexAllocator indices;
+        BlockAllocator data;
+    };
 
-    EntityTag next_entity;
+    struct ComponentBindingDesc {
+        EntityTag entity;
+        ComponentBinding binding;
+    };
+
+    IndexAllocator entity_indices;
+    std::vector<ComponentBindingDesc> pending_bindings;
+    std::vector<EntityTag> pending_deletions;
+
     std::vector<std::vector<ComponentBinding>> entities;
     std::unordered_map<ComponentID, ComponentStorage> components;
 };
 
 EntityTag World::SpawnEntity()
 {
-    EntityTag tag = entities.size();
-    entities.emplace_back();
-    return tag;
+    return entity_indices.ReserveIndex();
+}
+
+void World::KillEntity(EntityTag e)
+{
+    pending_deletions.push_back(e);
 }
 
 template <typename CType>
 void World::BindComponent(EntityTag e, CType const& c)
 {
-    ComponentID component_id = Component<CType>();
+    ComponentID const component_id = Component<CType>();
 
     if (components.count(component_id) == 0)
     {
         components.emplace(component_id, ComponentStorage{});
         ComponentStorage& storage = components[component_id];
-        storage.size = sizeof(CType);
-        storage.count = 0;
-        storage.alloc_count = 8;
-        storage.data = new uint8_t[storage.alloc_count * storage.size];
+        storage.data.element_size = sizeof(CType);
+        storage.data.block_size = 256;
     }
 
     ComponentStorage& storage = components[component_id];
-    ComponentTag component_tag = storage.count++;
-    if (storage.count > storage.alloc_count)
+    ComponentTag component_tag = storage.indices.ReserveIndex();
+    if (storage.indices.IndexCount() > storage.data.StorageSize())
+        storage.data.NewBlock();
+
+    std::memcpy(storage.data[component_tag], &c, storage.data.element_size);
+
+    pending_bindings.emplace_back(ComponentBindingDesc{ e, { component_id, component_tag } });
+}
+
+void World::Commit()
+{
+    entities.resize(entity_indices.IndexCount());
+    for (ComponentBindingDesc& binding : pending_bindings)
+        entities[binding.entity].emplace_back(std::move(binding.binding));
+    pending_bindings.clear();
+
+    for (EntityTag entity : pending_deletions)
     {
-        storage.alloc_count *= 2;
-        uint8_t* data = new uint8_t[storage.alloc_count * storage.size];
-        std::memcpy(data, storage.data, (storage.count-1) * storage.size);
-        delete [] storage.data;
-        storage.data = data;
+        for (ComponentBinding const& binding : entities[entity])
+            components[binding.type].indices.ReleaseIndex(binding.tag);
+        entities[entity].clear();
+        entity_indices.ReleaseIndex(entity);
     }
-
-    std::memcpy(storage.data + component_tag*storage.size, &c, storage.size);
-
-    entities[e].emplace_back(ComponentBinding{ component_id, component_tag });
 }
 
 template <typename ... CTypes>
@@ -221,7 +252,7 @@ void World::RunSystem(auto callback)
                                   });
 
                 ComponentStorage const& storage = *storages[tag_index];
-                components[tag_index] = storage.data + storage.size*binding.tag;
+                components[tag_index] = storage.data[binding.tag];
             }
 
             ForwardFunc<CTypes...>(callback, components.data());
@@ -272,6 +303,8 @@ int main(int argc, char const** argv)
         }
     }
 
+    world.Commit();
+
     world.RunSystem<Transform, RenderData>(
         [](Transform const& transform, RenderData const& renderData){
             std::cout << "(" << transform.x << " " << transform.y << " " << transform.z << ") ";
@@ -286,6 +319,17 @@ int main(int argc, char const** argv)
         }
     );
     std::cout << std::endl << std::endl;
+
+    world.RunSystem<Transform const>(
+        [&world](Transform const& transform) {
+            std::cout << transform.x << " ";
+            EntityTag entity = world.SpawnEntity();
+            world.BindComponent(entity, transform);
+        }
+    );
+    std::cout << std::endl << std::endl;
+
+    world.Commit();
 
     world.RunSystem<Transform const>(
         [](Transform const& transform) {
