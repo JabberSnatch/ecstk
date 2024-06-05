@@ -71,7 +71,7 @@ struct IndexAllocator
 struct BlockAllocator
 {
     void* operator[](uint64_t index) const {
-        return data[index/block_size].get() + index*element_size;
+        return data[index/block_size].get() + (index%block_size)*element_size;
     }
 
     void NewBlock() {
@@ -80,6 +80,16 @@ struct BlockAllocator
 
     size_t StorageSize() const {
         return data.size() * block_size;
+    }
+
+    uint64_t FindIndex(void const* element) const {
+        for (uint32_t block_index = 0; block_index < data.size(); ++block_index)
+        {
+            ptrdiff_t distance = (uint8_t const*)element - data[block_index].get();
+            if (distance >= 0 && distance < (ptrdiff_t)(block_size*element_size))
+                return block_index * block_size + (distance / element_size);
+        }
+        return ~0ull;
     }
 
     size_t element_size;
@@ -145,6 +155,8 @@ struct World
     template <typename CType> void BindComponent(EntityTag e, CType const& c);
     template <typename ... CTypes> void RunSystem(auto callback);
 
+    template <typename CType> EntityTag EntityLookup(CType const& c);
+
     void Commit();
 
     struct ComponentBinding {
@@ -155,6 +167,7 @@ struct World
     struct ComponentStorage {
         IndexAllocator indices;
         BlockAllocator data;
+        BlockAllocator entity_bindings;
     };
 
     struct ComponentBindingDesc {
@@ -191,16 +204,32 @@ void World::BindComponent(EntityTag e, CType const& c)
         ComponentStorage& storage = components[component_id];
         storage.data.element_size = sizeof(CType);
         storage.data.block_size = 256;
+        storage.entity_bindings.element_size = sizeof(uint64_t);
+        storage.entity_bindings.block_size = 2048;
     }
 
     ComponentStorage& storage = components[component_id];
     ComponentTag component_tag = storage.indices.ReserveIndex();
     if (storage.indices.IndexCount() > storage.data.StorageSize())
+    {
         storage.data.NewBlock();
+        storage.entity_bindings.NewBlock();
+    }
 
     std::memcpy(storage.data[component_tag], &c, storage.data.element_size);
+    *(uint64_t*)storage.entity_bindings[component_tag] = e;
 
     pending_bindings.emplace_back(ComponentBindingDesc{ e, { component_id, component_tag } });
+}
+
+template <typename CType>
+EntityTag World::EntityLookup(CType const& c)
+{
+    ComponentID const component_id = Component<CType>();
+
+    ComponentStorage const& storage = components[component_id];
+    uint64_t component_index = storage.data.FindIndex(&c);
+    return *(uint64_t*)storage.entity_bindings[component_index];
 }
 
 void World::Commit()
@@ -322,9 +351,11 @@ int main(int argc, char const** argv)
 
     world.RunSystem<Transform const>(
         [&world](Transform const& transform) {
-            std::cout << transform.x << " ";
+            EntityTag source_entity = world.EntityLookup(transform);
+            std::cout << "(" << transform.x << " " << source_entity << ") ";
             EntityTag entity = world.SpawnEntity();
             world.BindComponent(entity, transform);
+            world.KillEntity(source_entity);
         }
     );
     std::cout << std::endl << std::endl;
