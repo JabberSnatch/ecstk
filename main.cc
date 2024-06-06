@@ -5,6 +5,7 @@
 #include <type_traits>
 #include <memory>
 #include <iostream>
+#include <cmath>
 
 struct IndexAllocator
 {
@@ -156,6 +157,7 @@ struct World
     template <typename ... CTypes> void RunSystem(auto callback);
 
     template <typename CType> EntityTag EntityLookup(CType const& c);
+    template <typename CType> CType* ComponentLookup(EntityTag entity);
 
     void Commit();
 
@@ -289,6 +291,12 @@ void World::RunSystem(auto callback)
     }
 }
 
+struct Boid
+{
+    float px, py;
+    float vx, vy;
+};
+
 struct Transform
 {
     float x;
@@ -320,6 +328,18 @@ int main(int argc, char const** argv)
 
     for (uint32_t index = 0; index < 100; ++index)
     {
+        EntityTag entity = world.SpawnEntity();
+        Boid boid = {};
+        boid.px = (float)(index / 10);
+        boid.py = (float)(index % 10);
+        boid.vx = 0.5f;
+        boid.vy = 0.f;
+        world.BindComponent(entity, boid);
+    }
+
+    #if 0
+    for (uint32_t index = 0; index < 100; ++index)
+    {
         {
             EntityTag entity = world.SpawnEntity();
             world.BindComponent(entity, Transform{ 0.f + (float)index, 100.f, 200.f });
@@ -331,8 +351,77 @@ int main(int argc, char const** argv)
             world.BindComponent(entity, RenderData{ 4 });
         }
     }
+    #endif
 
     world.Commit();
+
+    static auto const boids_update = [&](){
+        float dt = 0.016f;
+        world.RunSystem<Boid>(
+            [&world, dt](Boid& boid) {
+                EntityTag entity = world.EntityLookup(boid);
+
+                uint32_t neighbour_count = 0;
+                float radius = 2.f;
+                float cx = 0.f, cy = 0.f;
+                float sx = 0.f, sy = 0.f;
+                float ax = 0.f, ay = 0.f;
+                world.RunSystem<Boid const>(
+                    [&](Boid const& other_boid) {
+                        EntityTag other_entity = world.EntityLookup(other_boid);
+                        if (other_entity == entity)
+                            return;
+
+                        float dx = boid.px - other_boid.px;
+                        float dy = boid.py - other_boid.py;
+                        float distance = std::sqrt(dx*dx + dy*dy);
+                        if (distance > radius)
+                            return;
+
+                        ++neighbour_count;
+
+                        if (distance > 0.001f)
+                        {
+                            sx += dx / distance;
+                            sy += dy / distance;
+                        }
+
+                        cx += other_boid.px;
+                        cy += other_boid.py;
+
+                        ax += other_boid.vx;
+                        ay += other_boid.vy;
+                    }
+                );
+
+                if (!neighbour_count)
+                    return;
+
+                cx /= (float)neighbour_count;
+                cy /= (float)neighbour_count;
+
+                sx /= (float)neighbour_count;
+                sy /= (float)neighbour_count;
+
+                ax /= (float)neighbour_count;
+                ay /= (float)neighbour_count;
+
+                boid.vx += (cx + sx + ax) / 3.f;
+                boid.vy += (cy + sy + ay) / 3.f;
+
+                boid.px += boid.vx * dt;
+                boid.py += boid.vy * dt;
+
+                std::cout << "(" << boid.px << " " << boid.py << ") ";
+            }
+        );
+    };
+
+    for (uint32_t index = 0; index < 100; ++index)
+    {
+        boids_update();
+        std::cout << "completed boids update " << index << std::endl;
+    }
 
     world.RunSystem<Transform, RenderData>(
         [](Transform const& transform, RenderData const& renderData){
